@@ -109,6 +109,92 @@ impl Record {
         Default::default()
     }
 
+    /// Replace the contents of an existing record with the record read from the decoder
+    pub fn read_into_self<'r>(&mut self, decoder: &mut BinDecoder<'r>) -> ProtoResult<()> {
+        // NAME            an owner name, i.e., the name of the node to which this
+        //                 resource record pertains.
+        self.name_labels.read_into_self(decoder)?;
+
+        // TYPE            two octets containing one of the RR TYPE codes.
+        self.rr_type = RecordType::read(decoder)?;
+
+        #[cfg(feature = "mdns")]
+        {
+            self.mdns_cache_flush = false;
+        }
+
+        // CLASS           two octets containing one of the RR CLASS codes.
+        self.dns_class = if self.rr_type == RecordType::OPT {
+            // verify that the OPT record is Root
+            if !self.name_labels.is_root() {
+                return Err(ProtoErrorKind::EdnsNameNotRoot(self.name_labels.clone()).into());
+            }
+
+            //  DNS Class is overloaded for OPT records in EDNS - RFC 6891
+            DNSClass::for_opt(
+                decoder.read_u16()?.unverified(/*restricted to a min of 512 in for_opt*/),
+            )
+        } else {
+            #[cfg(not(feature = "mdns"))]
+            {
+                DNSClass::read(decoder)?
+            }
+
+            #[cfg(feature = "mdns")]
+            {
+                let dns_class_value =
+                    decoder.read_u16()?.unverified(/*DNSClass::from_u16 will verify the value*/);
+                if dns_class_value & MDNS_ENABLE_CACHE_FLUSH > 0 {
+                    self.mdns_cache_flush = true;
+                    DNSClass::from_u16(dns_class_value & !MDNS_ENABLE_CACHE_FLUSH)?
+                } else {
+                    DNSClass::from_u16(dns_class_value)?
+                }
+            }
+        };
+
+        // TTL             a 32 bit signed integer that specifies the time interval
+        //                that the resource record may be cached before the source
+        //                of the information should again be consulted.  Zero
+        //                values are interpreted to mean that the RR can only be
+        //                used for the transaction in progress, and should not be
+        //                cached.  For example, SOA records are always distributed
+        //                with a zero TTL to prohibit caching.  Zero values can
+        //                also be used for extremely volatile data.
+        // note: u32 seems more accurate given that it can only be positive
+        self.ttl = decoder.read_u32()?.unverified(/*any u32 is valid*/);
+
+        // RDLENGTH        an unsigned 16 bit integer that specifies the length in
+        //                octets of the RDATA field.
+        let rd_length = decoder
+            .read_u16()?
+            .verify_unwrap(|u| (*u as usize) <= decoder.len())
+            .map_err(|u| {
+                ProtoError::from(format!(
+                    "rdata length too large for remaining bytes, need: {} remain: {}",
+                    u,
+                    decoder.len()
+                ))
+            })?;
+
+        // this is to handle updates, RFC 2136, which uses 0 to indicate certain aspects of
+        //  pre-requisites
+        self.rdata = if rd_length == 0 {
+            RData::NULL(NULL::new())
+        } else {
+            // RDATA           a variable length string of octets that describes the
+            //                resource.  The format of this information varies
+            //                according to the TYPE and CLASS of the resource record.
+            // Adding restrict to the rdata length because it's used for many calculations later
+            //  and must be validated before hand
+            let mut data = RData::ZERO; // Something which is cheap to construct
+            data.read_into_self(decoder, self.rr_type, Restrict::new(rd_length))?;
+            data
+        };
+
+        Ok(())
+    }
+
     /// Create a record with the specified initial values.
     ///
     /// # Arguments
@@ -367,95 +453,10 @@ impl BinEncodable for Record {
 }
 
 impl<'r> BinDecodable<'r> for Record {
-    /// parse a resource record line example:
-    ///  WARNING: the record_bytes is 100% consumed and destroyed in this parsing process
     fn read(decoder: &mut BinDecoder<'r>) -> ProtoResult<Record> {
-        // NAME            an owner name, i.e., the name of the node to which this
-        //                 resource record pertains.
-        let name_labels: Name = Name::read(decoder)?;
-
-        // TYPE            two octets containing one of the RR TYPE codes.
-        let record_type: RecordType = RecordType::read(decoder)?;
-
-        #[cfg(feature = "mdns")]
-        let mut mdns_cache_flush = false;
-
-        // CLASS           two octets containing one of the RR CLASS codes.
-        let class: DNSClass = if record_type == RecordType::OPT {
-            // verify that the OPT record is Root
-            if !name_labels.is_root() {
-                return Err(ProtoErrorKind::EdnsNameNotRoot(name_labels).into());
-            }
-
-            //  DNS Class is overloaded for OPT records in EDNS - RFC 6891
-            DNSClass::for_opt(
-                decoder.read_u16()?.unverified(/*restricted to a min of 512 in for_opt*/),
-            )
-        } else {
-            #[cfg(not(feature = "mdns"))]
-            {
-                DNSClass::read(decoder)?
-            }
-
-            #[cfg(feature = "mdns")]
-            {
-                let dns_class_value =
-                    decoder.read_u16()?.unverified(/*DNSClass::from_u16 will verify the value*/);
-                if dns_class_value & MDNS_ENABLE_CACHE_FLUSH > 0 {
-                    mdns_cache_flush = true;
-                    DNSClass::from_u16(dns_class_value & !MDNS_ENABLE_CACHE_FLUSH)?
-                } else {
-                    DNSClass::from_u16(dns_class_value)?
-                }
-            }
-        };
-
-        // TTL             a 32 bit signed integer that specifies the time interval
-        //                that the resource record may be cached before the source
-        //                of the information should again be consulted.  Zero
-        //                values are interpreted to mean that the RR can only be
-        //                used for the transaction in progress, and should not be
-        //                cached.  For example, SOA records are always distributed
-        //                with a zero TTL to prohibit caching.  Zero values can
-        //                also be used for extremely volatile data.
-        // note: u32 seems more accurate given that it can only be positive
-        let ttl: u32 = decoder.read_u32()?.unverified(/*any u32 is valid*/);
-
-        // RDLENGTH        an unsigned 16 bit integer that specifies the length in
-        //                octets of the RDATA field.
-        let rd_length = decoder
-            .read_u16()?
-            .verify_unwrap(|u| (*u as usize) <= decoder.len())
-            .map_err(|u| {
-                ProtoError::from(format!(
-                    "rdata length too large for remaining bytes, need: {} remain: {}",
-                    u,
-                    decoder.len()
-                ))
-            })?;
-
-        // this is to handle updates, RFC 2136, which uses 0 to indicate certain aspects of
-        //  pre-requisites
-        let rdata: RData = if rd_length == 0 {
-            RData::NULL(NULL::new())
-        } else {
-            // RDATA           a variable length string of octets that describes the
-            //                resource.  The format of this information varies
-            //                according to the TYPE and CLASS of the resource record.
-            // Adding restrict to the rdata length because it's used for many calculations later
-            //  and must be validated before hand
-            RData::read(decoder, record_type, Restrict::new(rd_length))?
-        };
-
-        Ok(Record {
-            name_labels,
-            rr_type: record_type,
-            dns_class: class,
-            ttl,
-            rdata,
-            #[cfg(feature = "mdns")]
-            mdns_cache_flush,
-        })
+        let mut this = Self::default();
+        this.read_into_self(decoder)?;
+        Ok(this)
     }
 }
 

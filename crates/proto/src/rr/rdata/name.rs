@@ -44,6 +44,7 @@ use crate::rr::domain::Name;
 use crate::serialize::binary::*;
 
 /// Read the RData from the given Decoder
+#[inline(always)]
 pub fn read(decoder: &mut BinDecoder<'_>) -> ProtoResult<Name> {
     Name::read(decoder)
 }

@@ -600,34 +600,39 @@ impl Message {
         // sig0 must be last, once this is set, disable.
         let mut saw_sig0 = false;
         for _ in 0..count {
-            let record = Record::read(decoder)?;
+            // Record is expensive to move, so we construct it in-place then mutate it
+            // This adds some complexity around removing the record if it shouldn't be in the Vec,
+            // but that code is very cold by comparison.
+            records.push(Record::default());
+            let record = records.last_mut().unwrap();
+            record.read_into_self(decoder)?;
 
             if !is_additional {
                 if saw_sig0 {
+                    records.pop();
                     return Err("sig0 must be final resource record".into());
                 } // SIG0 must be last
-                records.push(record)
             } else {
                 match record.rr_type() {
                     #[cfg(feature = "dnssec")]
                     RecordType::DNSSEC(DNSSECRecordType::SIG) => {
                         saw_sig0 = true;
-                        sig0s.push(record);
+                        sig0s.push(records.pop().unwrap());
                     }
                     RecordType::OPT => {
                         if saw_sig0 {
                             return Err("sig0 must be final resource record".into());
                         } // SIG0 must be last
                         if edns.is_some() {
+                            records.pop();
                             return Err("more than one edns record present".into());
                         }
-                        edns = Some((&record).into());
+                        edns = Some(Edns::from(&records.pop().unwrap()));
                     }
                     _ => {
                         if saw_sig0 {
                             return Err("sig0 must be final resource record".into());
                         } // SIG0 must be last
-                        records.push(record);
                     }
                 }
             }

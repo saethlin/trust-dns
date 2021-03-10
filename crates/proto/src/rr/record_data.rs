@@ -624,6 +624,16 @@ pub enum RData {
     ZERO,
 }
 
+macro_rules! reader {
+    ($fn:ident, $mod:ident, $variant:ident) => {
+        #[inline(never)]
+        fn $fn(&mut self, decoder: &mut BinDecoder<'_>) -> ProtoResult<()> {
+            *self = RData::$variant(rdata::$mod::read(decoder)?);
+            Ok(())
+        }
+    };
+}
+
 impl RData {
     fn to_bytes(&self) -> Vec<u8> {
         let mut buf: Vec<u8> = Vec::new();
@@ -636,26 +646,48 @@ impl RData {
         buf
     }
 
-    /// Read the RData from the given Decoder
+    reader!(read_a, a, A);
+    reader!(read_aaaa, aaaa, AAAA);
+    reader!(read_aname, name, ANAME);
+    reader!(read_cname, name, CNAME);
+    reader!(read_hinfo, hinfo, HINFO);
+    reader!(read_mx, mx, MX);
+    reader!(read_naptr, naptr, NAPTR);
+    reader!(read_ns, name, NS);
+
+    /// Read RData from the given Decoder
     pub fn read(
         decoder: &mut BinDecoder<'_>,
         record_type: RecordType,
         rdata_length: Restrict<u16>,
     ) -> ProtoResult<Self> {
+        let mut this = Self::ZERO;
+        this.read_into_self(decoder, record_type, rdata_length)?;
+        Ok(this)
+    }
+
+    /// Read RData from the given Decoder
+    #[inline(never)]
+    pub fn read_into_self(
+        &mut self,
+        decoder: &mut BinDecoder<'_>,
+        record_type: RecordType,
+        rdata_length: Restrict<u16>,
+    ) -> ProtoResult<()> {
         let start_idx = decoder.index();
 
         let result = match record_type {
             RecordType::A => {
                 trace!("reading A");
-                rdata::a::read(decoder).map(RData::A)
+                return self.read_a(decoder);
             }
             RecordType::AAAA => {
                 trace!("reading AAAA");
-                rdata::aaaa::read(decoder).map(RData::AAAA)
+                return self.read_aaaa(decoder);
             }
             RecordType::ANAME => {
                 trace!("reading ANAME");
-                rdata::name::read(decoder).map(RData::ANAME)
+                return self.read_aname(decoder);
             }
             rt @ RecordType::ANY | rt @ RecordType::AXFR | rt @ RecordType::IXFR => {
                 return Err(ProtoErrorKind::UnknownRecordTypeValue(rt.into()).into());
@@ -666,23 +698,23 @@ impl RData {
             }
             RecordType::CNAME => {
                 trace!("reading CNAME");
-                rdata::name::read(decoder).map(RData::CNAME)
+                return self.read_cname(decoder);
             }
             RecordType::HINFO => {
                 trace!("reading HINFO");
-                rdata::hinfo::read(decoder).map(RData::HINFO)
+                return self.read_hinfo(decoder);
             }
             RecordType::ZERO => {
                 trace!("reading EMPTY");
-                return Ok(RData::ZERO);
+                Ok(RData::ZERO)
             }
             RecordType::MX => {
                 trace!("reading MX");
-                rdata::mx::read(decoder).map(RData::MX)
+                return self.read_mx(decoder);
             }
             RecordType::NAPTR => {
                 trace!("reading NAPTR");
-                rdata::naptr::read(decoder).map(RData::NAPTR)
+                return self.read_naptr(decoder);
             }
             RecordType::NULL => {
                 trace!("reading NULL");
@@ -690,7 +722,7 @@ impl RData {
             }
             RecordType::NS => {
                 trace!("reading NS");
-                rdata::name::read(decoder).map(RData::NS)
+                return self.read_ns(decoder);
             }
             RecordType::OPENPGPKEY => {
                 trace!("reading OPENPGPKEY");
@@ -746,7 +778,8 @@ impl RData {
                 })
             })?;
 
-        result
+        *self = result?;
+        Ok(())
     }
 
     /// [RFC 4034](https://tools.ietf.org/html/rfc4034#section-6), DNSSEC Resource Records, March 2005
